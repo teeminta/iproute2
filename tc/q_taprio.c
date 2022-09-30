@@ -33,6 +33,12 @@ struct sched_entry {
 	uint8_t cmd;
 };
 
+struct queuemaxsdu_table {
+	struct list_head list;
+	uint32_t maxsdu_queue;
+	uint32_t maxsdu_size;
+};
+
 #define CLOCKID_INVALID (-1)
 static const struct static_clockid {
 	const char *name;
@@ -151,9 +157,50 @@ static struct sched_entry *create_entry(uint32_t gatemask, uint32_t interval, ui
 	return e;
 }
 
+static int add_queuemaxsdu_table(struct list_head *queuemaxsdu_tables, struct nlmsghdr *n)
+{
+	struct queuemaxsdu_table *t;
+
+	list_for_each_entry(t, queuemaxsdu_tables, list) {
+		struct rtattr *a;
+
+		a = addattr_nest(n, 1024, TCA_TAPRIO_QUEUEMAXSDU_TABLE);
+
+		addattr_l(n, 1024, TCA_TAPRIO_QUEUEMAXSDU_TABLE_MAXSDU_QUEUE,
+			  &t->maxsdu_queue, sizeof(t->maxsdu_queue));
+		addattr_l(n, 1024, TCA_TAPRIO_QUEUEMAXSDU_TABLE_MAXSDU_SIZE,
+			  &t->maxsdu_size, sizeof(t->maxsdu_size));
+
+		addattr_nest_end(n, a);
+	}
+
+	return 0;
+}
+
+static struct queuemaxsdu_table *create_queuemaxsdu_table(uint32_t maxsdu_queue,
+							  uint32_t maxsdu_size)
+{
+	struct queuemaxsdu_table *t;
+
+	t = calloc(1, sizeof(*t));
+	if (!t)
+		return NULL;
+
+	t->maxsdu_queue = maxsdu_queue;
+	t->maxsdu_size = maxsdu_size;
+
+	return t;
+}
+
+static void explain_queue_maxsdu(void)
+{
+	fprintf(stderr, "Usage: ... taprio ... queue-max-sdu <queue> <maximum sdu size>\n");
+}
+
 static int taprio_parse_opt(struct qdisc_util *qu, int argc,
 			    char **argv, struct nlmsghdr *n, const char *dev)
 {
+	struct list_head queuemaxsdu_tables;
 	__s32 clockid = CLOCKID_INVALID;
 	struct tc_mqprio_qopt opt = { };
 	__s64 cycle_time_extension = 0;
@@ -166,6 +213,7 @@ static int taprio_parse_opt(struct qdisc_util *qu, int argc,
 	int err, idx;
 
 	INIT_LIST_HEAD(&sched_entries);
+	INIT_LIST_HEAD(&queuemaxsdu_tables);
 
 	while (argc > 0) {
 		idx = 0;
@@ -243,6 +291,30 @@ static int taprio_parse_opt(struct qdisc_util *qu, int argc,
 			}
 
 			list_add_tail(&e->list, &sched_entries);
+
+		} else if (strcmp(*argv, "queue-max-sdu") == 0) {
+			uint32_t maxsdu_queue, maxsdu_size;
+			struct queuemaxsdu_table *t;
+
+			NEXT_ARG();
+			if (get_u32(&maxsdu_queue, *argv, 16)) {
+				explain_queue_maxsdu();
+				return -1;
+			}
+
+			NEXT_ARG();
+			if (get_u32(&maxsdu_size, *argv, 0)) {
+				explain_queue_maxsdu();
+				return -1;
+			}
+
+			t = create_queuemaxsdu_table(maxsdu_queue, maxsdu_size);
+			if (!t) {
+				fprintf(stderr, "taprio: not enough memory for new queue maxsdu\n");
+				return -1;
+			}
+
+			list_add_tail(&t->list, &queuemaxsdu_tables);
 
 		} else if (strcmp(*argv, "base-time") == 0) {
 			NEXT_ARG();
@@ -351,6 +423,16 @@ static int taprio_parse_opt(struct qdisc_util *qu, int argc,
 
 	addattr_nest_end(n, l);
 
+	l = addattr_nest(n, 1024, TCA_TAPRIO_ATTR_QUEUEMAXSDU_TABLE | NLA_F_NESTED);
+
+	err = add_queuemaxsdu_table(&queuemaxsdu_tables, n);
+	if (err < 0) {
+		fprintf(stderr, "Could not add queue maxsdu to netlink message\n");
+		return -1;
+	}
+
+	addattr_nest_end(n, l);
+
 	tail->rta_len = (void *) NLMSG_TAIL(n) - (void *) tail;
 
 	return 0;
@@ -404,6 +486,45 @@ static int print_sched_list(FILE *f, struct rtattr *list)
 	return 0;
 }
 
+static int print_queuemaxsdu_table(FILE *f, struct rtattr *list)
+{
+	struct rtattr *item;
+	int rem;
+
+	if (list == NULL)
+		return 0;
+
+	rem = RTA_PAYLOAD(list);
+
+	open_json_array(PRINT_JSON, "queuemaxsdu_tables");
+
+	print_nl();
+
+	for (item = RTA_DATA(list); RTA_OK(item, rem); item = RTA_NEXT(item, rem)) {
+		struct rtattr *tb[TCA_TAPRIO_QUEUEMAXSDU_TABLE_MAX + 1];
+		__u32 maxsdu_queue = 0, maxsdu_size = 0;
+
+		parse_rtattr_nested(tb, TCA_TAPRIO_QUEUEMAXSDU_TABLE_MAX, item);
+
+		if (tb[TCA_TAPRIO_QUEUEMAXSDU_TABLE_MAXSDU_QUEUE])
+			maxsdu_queue = rta_getattr_u32(tb[TCA_TAPRIO_QUEUEMAXSDU_TABLE_MAXSDU_QUEUE]);
+
+		if (tb[TCA_TAPRIO_QUEUEMAXSDU_TABLE_MAXSDU_SIZE])
+			maxsdu_size = rta_getattr_u32(tb[TCA_TAPRIO_QUEUEMAXSDU_TABLE_MAXSDU_SIZE]);
+
+		open_json_object(NULL);
+		print_uint(PRINT_ANY, "maxsdu-queue", " maxsdu-queue %d", maxsdu_queue);
+		print_uint(PRINT_ANY, "maxsdu-size", " maxsdu-size %d", maxsdu_size);
+		close_json_object();
+
+		print_nl();
+	}
+
+	close_json_array(PRINT_ANY, "");
+
+	return 0;
+}
+
 static int print_schedule(FILE *f, struct rtattr **tb)
 {
 	int64_t base_time = 0, cycle_time = 0, cycle_time_extension = 0;
@@ -426,6 +547,8 @@ static int print_schedule(FILE *f, struct rtattr **tb)
 		     " cycle-time-extension %lld", cycle_time_extension);
 
 	print_sched_list(f, tb[TCA_TAPRIO_ATTR_SCHED_ENTRY_LIST]);
+
+	print_queuemaxsdu_table(f, tb[TCA_TAPRIO_ATTR_QUEUEMAXSDU_TABLE]);
 
 	return 0;
 }
